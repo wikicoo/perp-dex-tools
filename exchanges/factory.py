@@ -21,6 +21,7 @@ class ExchangeFactory:
         'nado': 'exchanges.nado.NadoClient',
         'ethereal': 'exchanges.ethereal.EtherealClient',
         'standx': 'exchanges.standx.StandXClient',
+        'turboflow': 'exchanges.turboflow.TurboFlowClient',
     }
 
     @classmethod

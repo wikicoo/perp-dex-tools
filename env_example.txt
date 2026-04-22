@@ -67,6 +67,16 @@ STANDX_WALLET_ADDRESS=your_wallet_address_here
 STANDX_PRIVATE_KEY=your_wallet_private_key_here
 STANDX_CHAIN=bsc  # or solana
 
+# TurboFlow Configuration
+TURBOFLOW_API_KEY=your_turboflow_api_key_here
+TURBOFLOW_API_SECRET=your_turboflow_api_secret_here
+TURBOFLOW_BASE_URL=https://api.turboflow.xyz
+TURBOFLOW_WS_URL=wss://api.turboflow.xyz/realtime
+TURBOFLOW_POOL_ID=2
+TURBOFLOW_COIN_CODE=2
+TURBOFLOW_LANG=en
+TURBOFLOW_OPEN_VOL_BUFFER=0.0006
+
 # Notification (optional)
 # guide: https://www.feishu.cn/hc/zh-CN/articles/185289387886-%E6%B6%88%E6%81%AF%E5%8A%A9%E6%89%8B-%E6%9C%BA%E5%99%A8%E4%BA%BA
 LARK_TOKEN=
