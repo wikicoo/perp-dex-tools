@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,6 +61,8 @@ class TurboFlowClient(BaseExchangeClient):
         self.price_decimals: Optional[int] = None
         self._position_cache: Dict[str, Dict[str, Any]] = {}
         self.open_vol_buffer = Decimal(os.getenv("TURBOFLOW_OPEN_VOL_BUFFER", "0.0006"))
+        self.default_fee_mode = int(os.getenv("TURBOFLOW_FEE_MODE", "2"))
+        self.profit_share_offset = Decimal(os.getenv("TURBOFLOW_PROFIT_SHARE_OFFSET", "0.0025"))
 
     def _validate_config(self) -> None:
         required_env_vars = ["TURBOFLOW_API_KEY", "TURBOFLOW_API_SECRET"]
@@ -318,6 +321,25 @@ class TurboFlowClient(BaseExchangeClient):
         return price
 
     async def get_order_price(self, direction: str) -> Decimal:
+        latest_price = await self._get_latest_price(self.config.contract_id)
+        if latest_price <= 0:
+            raise ValueError("Invalid latest price")
+
+        if self.default_fee_mode == 2:
+            if direction == "buy":
+                order_price = latest_price * (Decimal("1") - self.profit_share_offset)
+            elif direction == "sell":
+                order_price = latest_price * (Decimal("1") + self.profit_share_offset)
+            else:
+                raise ValueError(f"Invalid direction: {direction}")
+
+            adjusted = self.round_to_tick(order_price)
+            self.logger.log(
+                f"TurboFlow profit-share order price for {direction}: latest={latest_price}, adjusted={adjusted}",
+                "INFO",
+            )
+            return adjusted
+
         best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
         if best_bid <= 0 or best_ask <= 0:
             raise ValueError("Invalid pseudo BBO prices")
@@ -341,12 +363,12 @@ class TurboFlowClient(BaseExchangeClient):
                 "coin_code": str(self.coin_code),
                 "order_type": "limit",
                 "order_way": order_way,
-                "margin_type": 1,
-                "leverage": 1,
+                "margin_type": 2,
+                "leverage": 10,
                 "vol": float(open_vol),
                 "position_mode": 1,
                 "time_in_force": "GTC",
-                "fee_mode": 1,
+                "fee_mode": self.default_fee_mode,
                 "order_mode": 1,
                 "price": str(self.round_to_tick(order_price)),
             }
@@ -385,6 +407,9 @@ class TurboFlowClient(BaseExchangeClient):
             adjusted_price = self.round_to_tick(adjusted_price)
             order_way = 4 if side == "sell" else 2
 
+            position = await self._get_position_for_close_side(side)
+            fee_mode = int(position.get("fee_mode", self.default_fee_mode)) if position else self.default_fee_mode
+
             payload = {
                 "request_id": int(time.time() * 1000),
                 "pair_id": str(self.pair_id or contract_id),
@@ -395,14 +420,29 @@ class TurboFlowClient(BaseExchangeClient):
                 "order_way": order_way,
                 "size": str(quantity),
                 "position_mode": 1,
+                "fee_mode": fee_mode,
                 "price": str(adjusted_price),
             }
 
-            position_id = await self._get_position_id_for_side(side)
+            position_id = position.get("id") if position else None
             if position_id:
                 payload["position_id"] = position_id
 
-            result = await self._make_request("POST", "/account/order/submit", data=payload)
+            try:
+                result = await self._make_request("POST", "/account/order/submit", data=payload)
+            except Exception as exc:
+                retry_price = self._extract_price_restriction(str(exc), side)
+                if retry_price is None:
+                    raise
+
+                payload["request_id"] = int(time.time() * 1000)
+                payload["price"] = str(retry_price)
+                self.logger.log(
+                    f"TurboFlow close price adjusted from {adjusted_price} to {retry_price} due to fee-mode restriction",
+                    "WARNING",
+                )
+                result = await self._make_request("POST", "/account/order/submit", data=payload)
+
             order = result["data"]["order"]
             return OrderResult(
                 success=True,
@@ -421,7 +461,7 @@ class TurboFlowClient(BaseExchangeClient):
     def _build_open_vol(self, quantity: Decimal) -> Decimal:
         return (Decimal(str(quantity)) * (Decimal("1") + self.open_vol_buffer)).quantize(Decimal("0.000001"))
 
-    async def _get_position_id_for_side(self, side: str) -> Optional[str]:
+    async def _get_position_for_close_side(self, side: str) -> Optional[Dict[str, Any]]:
         positions = await self._list_positions(status="Holding")
         expected_side = 1 if side == "sell" else 2
         for position in positions:
@@ -430,8 +470,33 @@ class TurboFlowClient(BaseExchangeClient):
             if int(position.get("side", 0)) == expected_side and Decimal(str(position.get("hold_size", "0"))) > 0:
                 position_id = str(position.get("id"))
                 self._position_cache[position_id] = position
-                return position_id
+                return position
         return None
+
+    def _extract_price_restriction(self, message: str, side: str) -> Optional[Decimal]:
+        match = re.search(r"(above|below)\s+the\s+([0-9]+(?:\.[0-9]+)?)\s+price", message, re.IGNORECASE)
+        if not match:
+            return None
+
+        direction = match.group(1).lower()
+        threshold = Decimal(match.group(2))
+
+        if direction == "above":
+            adjusted = threshold + self.config.tick_size
+        else:
+            adjusted = threshold - self.config.tick_size
+
+        if adjusted <= 0:
+            adjusted = threshold
+
+        adjusted = self.round_to_tick(adjusted)
+
+        if side == "sell" and adjusted <= threshold:
+            adjusted = self.round_to_tick(threshold + self.config.tick_size)
+        elif side == "buy" and adjusted >= threshold:
+            adjusted = self.round_to_tick(max(threshold - self.config.tick_size, self.config.tick_size))
+
+        return adjusted
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         payload = {
